@@ -1,0 +1,243 @@
+name: Docker (x86_64)
+
+# 手动触发，构建与官方 mlikiowa/napcat-docker 行为一致的 x86_64 镜像，
+# 校验后发布到 ghcr.io/umbrella0162/napcat。
+#
+# 只对 workflow_dispatch 生效：不跟随 push / PR，避免与上游发布链抢跑。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要构建的 ref（分支或 tag），留空用当前分支'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: umbrella0162/napcat
+  # 官方 build history 里的 QQ 安装包路径
+  QQ_VERSION_PATH: 9.9.36/beta/9ee04bef/linuxqq_3.2.34-53644
+
+jobs:
+  # 构建 NapCat.Shell.zip —— 官方镜像里那个 zip 的等价物
+  build-shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Compute version
+        id: v
+        run: |
+          set -euo pipefail
+          REF="${GITHUB_REF_NAME}"
+          if [[ "$REF" == v* ]]; then
+            VERSION="${REF#v}"
+          else
+            LATEST=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || echo v0.0.0)
+            VERSION="${LATEST#v}-main.${GITHUB_RUN_NUMBER}+${GITHUB_SHA::7}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: pnpm
+
+      - run: pnpm i
+
+      - run: pnpm --filter napcat-webui-frontend run build
+
+      - name: Build NapCat.Shell
+        env:
+          NAPCAT_VERSION: ${{ steps.v.outputs.version }}
+        run: pnpm run build:shell
+
+      - run: pnpm --filter napcat-plugin-builtin run build
+
+      # 与官方 release 流水线一致：剥离构建期依赖后压成扁平 zip
+      - name: Package NapCat.Shell.zip
+        run: |
+          set -euo pipefail
+          mv packages/napcat-shell/dist shell-dist
+          cd shell-dist
+          npm pkg delete devDependencies
+          npm install --omit=dev
+          rm -f package-lock.json
+          zip -qr "$GITHUB_WORKSPACE/NapCat.Shell.zip" .
+      - uses: actions/upload-artifact@v6
+        with:
+          name: NapCat.Shell.zip
+          path: NapCat.Shell.zip
+          retention-days: 3
+
+  # 构建镜像 → 与官方契约比对 → 运行时行为断言
+  image:
+    needs: build-shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: NapCat.Shell.zip
+          path: docker
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/Dockerfile
+          load: true
+          platforms: linux/amd64
+          tags: napcat:parity
+          build-args: |
+            QQ_VERSION_PATH=${{ env.QQ_VERSION_PATH }}
+            QQ_ARCH=amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 静态契约：配置 / 环境 / 文件哈希 / 依赖 / 用户 / QQ
+      - name: Verify parity with official baseline
+        run: |
+          set -euo pipefail
+          docker save napcat:parity -o ours.tar
+          python3 scripts/parity.py extract ours.tar -o ours.json
+          python3 scripts/parity.py compare docker/official-contract.json ours.json
+      # 运行时行为：entrypoint.sh 的实际效果 + QQ 进程
+      # 断言用 jq（GitHub runner 已预装），避免在 YAML 块里嵌 heredoc
+      - name: Verify runtime behaviour
+        run: |
+          set -uo pipefail
+          NAME="napcat-parity-${{ github.run_id }}"
+          docker run -d --name "$NAME" -e MODE=ws -e WEBUI_TOKEN=paritytest123 napcat:parity
+          fail=0
+          ok ()  { echo "PASS $1"; }
+          bad () { echo "FAIL $1"; fail=1; }
+          # 1) 官方 zip 布局能被 entrypoint 正确解开
+          for _ in $(seq 1 45); do
+            docker exec "$NAME" test -f /app/napcat/napcat.mjs 2>/dev/null && break
+            sleep 2
+          done
+          if docker exec "$NAME" test -f /app/napcat/napcat.mjs; then
+            ok "NapCat.Shell.zip 解开到 /app/napcat"
+          else
+            bad "容器内没有 /app/napcat/napcat.mjs"
+          fi
+          # 2) WEBUI_TOKEN 生成 webui.json（0.0.0.0:6099 / 给定 token / loginRate 3）
+          docker exec "$NAME" cat /app/napcat/config/webui.json > webui.json 2>/dev/null || echo '{}' > webui.json
+          if jq -e '.host=="0.0.0.0" and .port==6099 and .token=="paritytest123" and .loginRate==3' webui.json >/dev/null; then
+            ok "WEBUI_TOKEN 生效：webui.json 为 0.0.0.0:6099"
+          else
+            bad "webui.json 内容不符: $(cat webui.json)"
+          fi
+          # 3) MODE=ws 生成的配置等于官方 ws 模板
+          docker exec "$NAME" cat /app/napcat/config/onebot11.json > onebot11.json 2>/dev/null || echo '{}' > onebot11.json
+          if diff <(jq -S . onebot11.json) <(jq -S . docker/templates/ws.json) >/dev/null; then
+            ok "MODE=ws 生成的 onebot11.json 等于官方模板"
+          else
+            bad "onebot11.json 与官方 ws 模板不同"
+          fi
+          # 4) NapCat 真的在 QQ 里跑起来了
+          #    不用进程名判断：Chromium 会改写 argv，docker top 看不到 /opt/QQ/qq。
+          #    NapCat 跑到登录环节会生成二维码，这只能由 napcat.mjs 产生。
+          for _ in $(seq 1 30); do
+            docker exec "$NAME" test -f /app/napcat/cache/qrcode.png 2>/dev/null && break
+            docker logs "$NAME" 2>&1 | grep -qE 'qrcode|二维码' && break
+            sleep 2
+          done
+          if docker exec "$NAME" test -f /app/napcat/cache/qrcode.png 2>/dev/null \
+             || docker logs "$NAME" 2>&1 | grep -qE 'qrcode|二维码'; then
+            ok "NapCat 已在 QQ 内加载（生成登录二维码）"
+          else
+            bad "未见 NapCat 加载迹象（无二维码）"
+          fi
+          echo "---- 容器日志（尾部） ----"
+          docker logs "$NAME" 2>&1 | tail -n 30 || true
+          docker rm -f "$NAME" >/dev/null 2>&1 || true
+          exit "$fail"
+  # 发布到 ghcr.io/umbrella0162/napcat
+  publish:
+    needs: [build-shell, image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: NapCat.Shell.zip
+          path: docker
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: tags
+        run: |
+          set -euo pipefail
+          SHORT="${GITHUB_SHA::7}"
+          OUT=""
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            T="${GITHUB_REF_NAME#v}"
+            OUT="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${T}"
+            if [[ "$T" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+              OUT="${OUT}"$'\n'"${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            fi
+            OUT="${OUT}"$'\n'"${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          else
+            OUT="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main"
+          fi
+          OUT="${OUT}"$'\n'"${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${SHORT}"
+          {
+            echo 'tags<<EOF'
+            echo "$OUT"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - name: Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            QQ_VERSION_PATH=${{ env.QQ_VERSION_PATH }}
+            QQ_ARCH=amd64
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=NapCat-Docker
+            org.opencontainers.image.description=NapCat-Docker (parity build of mlikiowa/napcat-docker)
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo '### 已发布'
+            echo ''
+            echo '```'
+            echo '${{ steps.tags.outputs.tags }}' | while read -r t; do
+              [[ -n "$t" ]] && echo "docker pull $t"
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
